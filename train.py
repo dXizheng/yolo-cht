@@ -33,7 +33,8 @@ def setup_logging(args):
 
     # Create log directory
     quant_folder = args.quantization if args.quantization != 'none' else 'fp32'
-    log_dir = Path(args.project) / args.name / quant_folder / args.replace_mode / args.optimizer / 'logs'
+    freeze_folder = "unfreeze_all" if args.unfreeze_all else "freeze"
+    log_dir = Path(args.project) / args.name / quant_folder / args.replace_mode / freeze_folder / args.optimizer / 'logs'
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Create unique log filename with timestamp
@@ -84,6 +85,38 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from yolo26n.yolo26n_cht_qat_model import load_yolo26n_cht_qat_model, count_model_params
 from yolo26n.yolo26n_config import ReplaceMode
 from yolo26n.metrics import DetectionLossReproduced
+
+
+def load_cht_config(config_name='baseline', config_path=None):
+    """
+    Load CHT configuration from YAML file.
+
+    Args:
+        config_name: 'baseline' or 'optimized'
+        config_path: Custom config file path (overrides config_name)
+
+    Returns:
+        Dictionary with CHT configuration parameters
+    """
+    if config_path is None:
+        # Use built-in config files
+        base_dir = Path(__file__).parent
+        if config_name == 'baseline':
+            config_path = base_dir / 'config_baseline.yaml'
+        elif config_name == 'optimized':
+            config_path = base_dir / 'config_optimized.yaml'
+        else:
+            raise ValueError(f"Unknown config name: {config_name}")
+
+    if not Path(config_path).exists():
+        print(f"Warning: Config file {config_path} not found, using default values")
+        return {}
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    print(f"Loaded CHT config: {config_path}")
+    return config
 
 
 def _default_collate_fn(batch):
@@ -161,6 +194,11 @@ def parse_args():
     parser.add_argument('--optimizer', type=str, default='sgd',
                        choices=['sgd', 'muon', 'adamw'],
                        help='Optimizer: sgd (default), muon (Muon for weights + AdamW for biases)')
+    parser.add_argument('--config', type=str, default='baseline',
+                       choices=['baseline', 'optimized'],
+                       help='CHT config to use: baseline (original) or optimized (with CHTss)')
+    parser.add_argument('--cht-config', type=str, default=None,
+                       help='Path to custom CHT config YAML file')
     parser.add_argument('--lr', type=float, default=0.01,
                        help='Learning rate for SGD, muon uses 0.02')
     parser.add_argument('--momentum', type=float, default=0.937,
@@ -873,6 +911,31 @@ def main():
     else:
         replace_mode = ReplaceMode.ALL
 
+    # Load CHT config
+    cht_config = load_cht_config(args.config, args.cht_config)
+
+    # Extract config values (CLI args override config file if provided)
+    link_update_ratio = cht_config.get('link_update_ratio', 0.1)
+    evolve_duration = cht_config.get('ss_duration', 0)
+    evolve_speed = cht_config.get('ss_k', 0.1)
+    delta = cht_config.get('delta', 0.3)
+    delta_max = cht_config.get('delta_max', 0.5)
+    delta_d = cht_config.get('delta_d', 0.01)
+    delta_remove = cht_config.get('delta_remove', 0.5)
+    sparsity_warmup = cht_config.get('sparsity_warmup_epochs', args.sparsity_warmup)
+    sparsity_step = cht_config.get('sparsity_step_epochs', args.sparsity_step)
+    sparsity_step_size = cht_config.get('sparsity_step_size', args.sparsity_step_size)
+
+    # Print config info
+    print(f"\nCHT Configuration ({args.config}):")
+    print(f"  link_update_ratio: {link_update_ratio}")
+    print(f"  evolve_duration (CHTss): {evolve_duration}")
+    print(f"  evolve_speed: {evolve_speed}")
+    print(f"  delta: {delta}, delta_max: {delta_max}, delta_d: {delta_d}")
+    print(f"  sparsity_warmup_epochs: {sparsity_warmup}")
+    print(f"  sparsity_step_epochs: {sparsity_step}")
+    print(f"  sparsity_step_size: {sparsity_step_size}")
+
     # Load model
     print("\nLoading model...")
     model = load_yolo26n_cht_qat_model(
@@ -883,19 +946,26 @@ def main():
         regrow_method="L3n",
         shared_mask_sw=True,
         soft=True,
-        link_update_ratio=0.08,
+        link_update_ratio=link_update_ratio,
         skip_first_n_convs=args.skip_first_convs,
         replace_inside_attention=args.replace_inside_attention,
         sparsity_schedule=args.sparsity_schedule,
-        sparsity_warmup_epochs=args.sparsity_warmup,
-        sparsity_step_epochs=args.sparsity_step,
-        sparsity_step_size=args.sparsity_step_size
+        sparsity_warmup_epochs=sparsity_warmup,
+        sparsity_step_epochs=sparsity_step,
+        sparsity_step_size=sparsity_step_size,
+        # Additional CHT config from YAML
+        evolve_duration=evolve_duration,
+        evolve_speed=evolve_speed,
+        delta=delta,
+        delta_max=delta_max,
+        delta_d=delta_d,
+        delta_remove=delta_remove
     )
 
     # Unfreeze all parameters if requested
     if args.unfreeze_all:
         print("\nUnfreezing all parameters...")
-        for p in model._model.parameters():
+        for p in model.parameters():
             p.requires_grad = True
 
     # Count parameters
@@ -983,11 +1053,27 @@ def main():
     # lr = lr0 * (1 - cos(pi * epoch / epochs)) / 2
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0.0001)
 
+    # Initialize tracking variables
+    map_history = []  # Track mAP@50 for each epoch
+    best_map = 0.0
+
+    # Validate at baseline (epoch 0) before training starts
+    print("\n  Validating at baseline (epoch 0)...")
+    val_metrics = validate(
+        model, device,
+        data_yaml=args.data,
+        imgsz=args.imgsz,
+        batch_size=args.batch_size,
+        verbose=args.verbose,
+        conf_threshold=0.001
+    )
+    print(f"  Baseline mAP@50: {val_metrics['mAP50']:.4f}, mAP@50:95: {val_metrics['mAP50-95']:.4f}")
+    map_history.append(val_metrics['mAP50'])
+    best_map = val_metrics['mAP50']
+
     # Training loop
     print("\nStarting training...")
     print(f"Warmup: {warmup_epochs} epochs")
-    best_map = 0.0
-    map_history = []  # Track mAP@50 for each epoch
 
     # Warmup settings - use optimizer-specific base LR
     if args.optimizer == 'sgd':
@@ -1040,14 +1126,6 @@ def main():
             best_map = val_metrics['mAP50']
             print(f"  New best mAP@50: {best_map:.4f}")
 
-        # Save periodic checkpoint
-        if args.save_period > 0 and epoch % args.save_period == 0:
-            # Create subfolder based on quantization type, replace mode, and optimizer
-            quant_folder = args.quantization if args.quantization != 'none' else 'fp32'
-            checkpoint_path = Path(args.project) / args.name / quant_folder / args.replace_mode / args.optimizer / 'weights' / f'epoch_{epoch}.pt'
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            save_checkpoint(model, args, epoch, checkpoint_path)
-
         # Update scheduler only after warmup (to avoid conflict with warmup LR)
         if epoch > warmup_epochs:
             scheduler.step()
@@ -1061,6 +1139,7 @@ def main():
 
     # Prepare quant folder for saving
     quant_folder = args.quantization if args.quantization != 'none' else 'fp32'
+    freeze_folder = "unfreeze_all" if args.unfreeze_all else "freeze"
 
     # Plot mAP curve
     epochs = list(range(1, len(map_history) + 1))
@@ -1075,14 +1154,14 @@ def main():
     plt.tight_layout()
 
     # Save plot
-    plot_path = Path(args.project) / args.name / quant_folder / args.replace_mode / args.optimizer / 'weights' / 'map_curve.png'
+    plot_path = Path(args.project) / args.name / quant_folder / args.replace_mode / freeze_folder / args.optimizer / 'weights' / 'map_curve.png'
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(plot_path, dpi=150)
     plt.close()
     print(f"\nmAP curve saved to: {plot_path}")
 
     # Save final model with CHT metadata
-    save_path = Path(args.project) / args.name / quant_folder / args.replace_mode / args.optimizer / 'weights' / 'last.pt'
+    save_path = Path(args.project) / args.name / quant_folder / args.replace_mode / freeze_folder / args.optimizer / 'weights' / 'last.pt'
     save_path.parent.mkdir(parents=True, exist_ok=True)
     save_checkpoint(model, args, args.epochs, save_path)
 

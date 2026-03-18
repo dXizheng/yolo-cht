@@ -1,0 +1,58 @@
+# YOLO26n CHT Configuration - Optimized
+# For optimize-evolution branch
+# Key changes from baseline:
+# - CHTss enabled (evolve_duration=50)
+# - Slower, smoother sparsity schedule
+# - More deterministic delta values
+# - Higher link update ratio
+
+# CHT Sparsity Configuration
+sparsity: 0.9                    # Target sparsity (0.9 = 90%) - same as baseline
+mlp_sparsity: 0.5
+link_update_ratio: 0.2           # CHANGED: 0.1 -> 0.2 (faster adaptation)
+remove_method: wm
+regrow_method: L3n
+shared_mask_sw: true
+shared_mask_zone: false
+zone_sz: 0
+avg_remove: true
+avg_regrow: true
+soft: true
+use_opt4: true
+delta: 0.2                      # CHANGED: 0.3 -> 0.2 (more deterministic)
+delta_max: 0.3                 # CHANGED: 0.5 -> 0.3 (less randomness)
+delta_d: 0.005                 # CHANGED: 0.01 -> 0.005 (slower increase)
+delta_remove: 0.3              # CHANGED: 0.5 -> 0.3
+ch_method: CH3
+use_hidden: false
+l3n_batch_sz: 32
+evolve_es: false
+use_manual: false
+
+# CHTss (Smooth Sparsity) - ENABLED in optimized version
+use_ss: true                   # CHANGED: false -> true
+ss_sparsity_initial: 0.0       # Start from dense
+ss_k: 0.2                      # CHANGED: 0.1 -> 0.2
+ss_duration: 50                # CHANGED: 0 -> 50 (epochs for smooth transition)
+
+# Sparsity Schedule - SLOWER in optimized version
+sparsity_schedule: step
+sparsity_warmup_epochs: 10     # CHANGED: 5 -> 10 (more warmup)
+sparsity_step_epochs: 10       # CHANGED: 5 -> 10 (slower progression)
+sparsity_step_size: 0.05       # CHANGED: 0.1 -> 0.05 (smaller steps)
+
+# Model Replacement
+replace_mode: backbone_neck
+skip_first_n_convs: 2
+
+# QAT Configuration
+qat_enabled: true
+quantization_dtype: int8
+
+# Training Configuration
+epochs: 100
+batch_size: 16
+imgsz: 640
+device: cuda
+verbose: true
+debug: false

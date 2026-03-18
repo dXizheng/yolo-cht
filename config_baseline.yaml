@@ -1,0 +1,63 @@
+# YOLO26n CHT Configuration - Baseline (Original)
+# This is the original configuration before optimization
+# Saved for reference and comparison
+
+# Key baseline settings:
+# - sparsity: 0.9 (90%)
+# - use_ss: False (disabled)
+# - link_update_ratio: 0.1
+# - delta: 0.3, delta_max: 0.5
+# - sparsity_warmup_epochs: 5
+# - sparsity_step_epochs: 5
+# - sparsity_step_size: 0.1
+
+# CHT Sparsity Configuration
+sparsity: 0.9                    # Target sparsity (0.9 = 90%)
+mlp_sparsity: 0.5                # Sparsity for MLP layers
+link_update_ratio: 0.1          # Fraction of active connections to update per evolve
+remove_method: wm               # Weight magnitude removal
+regrow_method: L3n              # CHT regrow method
+shared_mask_sw: true            # Share mask across sliding windows
+shared_mask_zone: false
+zone_sz: 0
+avg_remove: true
+avg_regrow: true
+soft: true                      # Soft removal/regrowth
+use_opt4: true
+delta: 0.3                      # Soft selection temperature
+delta_max: 0.5
+delta_d: 0.01
+delta_remove: 0.5
+ch_method: CH3                  # CHT evolution method
+use_hidden: false
+l3n_batch_sz: 32
+evolve_es: false
+use_manual: false
+
+# CHTss (Smooth Sparsity) - Disabled in baseline
+use_ss: false
+ss_sparsity_initial: 0.0
+ss_k: 0.1
+ss_duration: 0
+
+# Sparsity Schedule
+sparsity_schedule: step         # "immediate", "step", "linear", "sigmoid"
+sparsity_warmup_epochs: 5       # Epochs before sparsity starts
+sparsity_step_epochs: 5         # Epochs between sparsity increases
+sparsity_step_size: 0.1         # Sparsity increase per step
+
+# Model Replacement
+replace_mode: backbone_neck     # "backbone", "backbone_neck", "all"
+skip_first_n_convs: 2           # Early convs to skip from CHT
+
+# QAT Configuration
+qat_enabled: true
+quantization_dtype: int8        # "int8", "fp8", or null
+
+# Training Configuration
+epochs: 100
+batch_size: 16
+imgsz: 640
+device: cuda
+verbose: true
+debug: false

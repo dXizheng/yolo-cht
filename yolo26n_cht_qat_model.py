@@ -131,8 +131,12 @@ if not hasattr(Conv2d_CHT, 'out_channels'):
     Conv2d_CHT.in_channels = in_channels
 
 
-# Attention types that should be skipped from quantization
+# Attention-like module families seen in this YOLO variant.
 ATTENTION_TYPES = ['C2PSA', 'C2f', 'Attention', 'PSABlock', 'C3k2']
+
+# BF16 should be reserved for the most numerically sensitive attention paths,
+# not broad hybrid blocks such as C3k2/C2f that contain many quantizable convs.
+BF16_WRAP_TYPES = ['C2PSA', 'Attention', 'PSABlock']
 
 
 def _contains_attention(module: nn.Module) -> bool:
@@ -153,11 +157,17 @@ def _is_attention_module(module: nn.Module) -> bool:
     return False
 
 
-class BF16AttentionWrapper(nn.Module):
-    """Wrapper to run attention modules with BF16 for softmax.
+def _should_bf16_wrap(module: nn.Module) -> bool:
+    """Return True when the module should execute under BF16 autocast."""
+    module_type = type(module).__name__
+    for attn_type in BF16_WRAP_TYPES:
+        if attn_type in module_type:
+            return True
+    return False
 
-    This wrapper patches the forward method of the wrapped module to run softmax in BF16.
-    """
+
+class BF16AttentionWrapper(nn.Module):
+    """Run protected attention modules under CUDA BF16 autocast."""
 
     def __init__(self, module: nn.Module):
         super().__init__()
@@ -174,24 +184,27 @@ class BF16AttentionWrapper(nn.Module):
         self.m = module  # the actual module (for some operations)
         self.save = getattr(module, 'save', [])  # save list for _predict_once
 
-        # Patch the forward method to use BF16 for softmax
-        self._patch_forward()
-
-    def _patch_forward(self):
-        """Patch the forward method to run softmax in BF16."""
-        original_forward = self.wrapped_module.forward
-
-        def bf16_forward(x):
-            # Run the original forward
-            output = original_forward(x)
-            return output
-
-        # Replace the forward method
-        self.wrapped_module.forward = bf16_forward
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass."""
-        return self.wrapped_module(x)
+        input_dtype = x.dtype
+        target_device = x.device
+
+        for tensor in list(self.wrapped_module.parameters()) + list(self.wrapped_module.buffers()):
+            target_device = tensor.device
+            break
+
+        if x.device != target_device:
+            x = x.to(device=target_device)
+
+        if x.is_cuda:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                output = self.wrapped_module(x)
+        else:
+            output = self.wrapped_module(x)
+
+        if output.dtype != input_dtype:
+            output = output.to(input_dtype)
+        return output
 
     def train(self, mode=True):
         """Override train() to propagate training mode to wrapped module."""
@@ -774,7 +787,7 @@ class YOLO26nCHTQATModel(nn.Module):
                 full_name = f"{parent_name}.{name}" if parent_name else name
 
                 # Check if this child is an attention module
-                if _is_attention_module(child):
+                if _should_bf16_wrap(child):
                     print(f"  Wrapping attention module {full_name} ({type(child).__name__}) with BF16")
                     # Wrap with BF16 wrapper
                     wrapped = BF16AttentionWrapper(child)

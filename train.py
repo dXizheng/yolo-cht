@@ -1186,6 +1186,57 @@ class CombinedMuonAdamW(torch.optim.Optimizer):
         self.adamw.load_state_dict(state_dict['adamw'])
 
 
+def _get_top_level_index(param_name: str):
+    parts = param_name.split('.')
+    if len(parts) >= 2 and parts[0] == 'model' and parts[1].isdigit():
+        return int(parts[1])
+    return None
+
+
+def split_muon_params(model: torch.nn.Module):
+    """Split params so Muon only touches safer hidden backbone/neck matrix weights."""
+    active_model = model._model if hasattr(model, '_model') else model
+
+    muon_params = []
+    adamw_params = []
+
+    muon_names = []
+    adamw_names = []
+
+    critical_attention_tokens = ('qkv', 'proj', 'pe', 'ffn', 'mlp')
+    norm_tokens = ('bn', 'norm', 'ln')
+
+    for name, param in active_model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        top_idx = _get_top_level_index(name)
+        is_head = top_idx is not None and top_idx >= 17
+        is_first_conv = name.startswith('model.0')
+        is_matrix_weight = param.ndim >= 2
+        is_bias = name.endswith('.bias')
+        is_norm = any(token in name.lower().split('.') for token in norm_tokens)
+        is_critical_attention = any(token in name.lower() for token in critical_attention_tokens)
+
+        use_muon = (
+            is_matrix_weight
+            and not is_first_conv
+            and not is_head
+            and not is_bias
+            and not is_norm
+            and not is_critical_attention
+        )
+
+        if use_muon:
+            muon_params.append(param)
+            muon_names.append(name)
+        else:
+            adamw_params.append(param)
+            adamw_names.append(name)
+
+    return muon_params, adamw_params, muon_names, adamw_names
+
+
 def main():
     """Main training function with Ultralytics-aligned components."""
     set_seed()
@@ -1378,11 +1429,13 @@ def main():
         print(f"Using SGD optimizer (lr={args.lr}, momentum={args.momentum}, weight_decay={args.weight_decay})")
     elif args.optimizer == 'muon':
         from Muon.muon import SingleDeviceMuon
-        # Separate params: Muon for weights (ndim >= 2), AdamW for biases/norms (ndim < 2)
-        muon_params = [p for p in model.parameters() if p.ndim >= 2]
-        other_params = [p for p in model.parameters() if p.ndim < 2]
+        muon_params, other_params, muon_names, adamw_names = split_muon_params(model)
         muon_lr = 0.001  # Start with lower LR for Muon, similar to standard training
         adam_lr = args.lr * 0.1  # Lower LR for biases
+
+        if len(muon_params) == 0:
+            raise RuntimeError("Muon optimizer selected, but no eligible hidden matrix weights were found.")
+
         muon_opt = SingleDeviceMuon(
             muon_params,
             lr=muon_lr,
@@ -1396,6 +1449,17 @@ def main():
         )
         optimizer = CombinedMuonAdamW(muon_opt, adamw_opt)
         print(f"Using Muon optimizer (muon_lr={muon_lr}, adamw_lr={adam_lr}, weight_decay={args.weight_decay})")
+        print(f"  Muon param tensors: {len(muon_params)}")
+        print(f"  AdamW param tensors: {len(other_params)}")
+        print(f"  Muon param count: {sum(p.numel() for p in muon_params):,}")
+        print(f"  AdamW param count: {sum(p.numel() for p in other_params):,}")
+        if args.verbose:
+            print("  Muon parameter sample:")
+            for name in muon_names[:10]:
+                print(f"    {name}")
+            print("  AdamW parameter sample:")
+            for name in adamw_names[:10]:
+                print(f"    {name}")
     elif args.optimizer == 'adamw':
         # Use AdamW for all parameters with lower LR (AdamW typically works better with lower LR)
         adam_lr = 0.001  # Much lower than SGD default

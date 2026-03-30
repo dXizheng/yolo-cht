@@ -153,6 +153,15 @@ def _is_attention_module(module: nn.Module) -> bool:
     return False
 
 
+def _get_attention_module_type(module: nn.Module) -> Optional[str]:
+    """Return the configured attention family name for a module, if any."""
+    module_type = type(module).__name__
+    for attn_type in ATTENTION_TYPES:
+        if attn_type in module_type:
+            return attn_type
+    return None
+
+
 class BF16AttentionWrapper(nn.Module):
     """Wrapper to run attention modules with BF16 for softmax.
 
@@ -510,6 +519,7 @@ class YOLO26nCHTQATModel(nn.Module):
         enable_qat: bool = True,
         skip_first_n_convs: int = 2,
         replace_inside_attention: bool = False,
+        replace_attention_types: Optional[List[str]] = None,
         quantization_dtype: str = "int8"
     ):
         """
@@ -525,6 +535,7 @@ class YOLO26nCHTQATModel(nn.Module):
             enable_qat: Enable quantization-aware training
             skip_first_n_convs: Number of early conv layers to skip from CHT (keep dense)
             replace_inside_attention: Whether to replace Conv2d inside attention modules with CHT
+            replace_attention_types: Attention module families eligible for internal replacement
             quantization_dtype: Quantization type ('int8', 'fp8', or None)
         """
         super().__init__()
@@ -536,6 +547,7 @@ class YOLO26nCHTQATModel(nn.Module):
         self.enable_qat = enable_qat
         self.skip_first_n_convs = skip_first_n_convs
         self.replace_inside_attention = replace_inside_attention
+        self.replace_attention_types = sorted(set(replace_attention_types or []))
         self.quantization_dtype = quantization_dtype
 
         # Store original model
@@ -564,6 +576,7 @@ class YOLO26nCHTQATModel(nn.Module):
             enable_qat,
             skip_first_n_convs,
             replace_inside_attention,
+            self.replace_attention_types,
             quantization_dtype
         )
 
@@ -632,10 +645,14 @@ class YOLO26nCHTQATModel(nn.Module):
         enable_qat: bool,
         skip_first_n_convs: int = 2,
         replace_inside_attention: bool = False,
+        replace_attention_types: Optional[List[str]] = None,
         quantization_dtype: str = "int8"
     ) -> nn.Module:
         """Build model with CHT and optionally QAT layers."""
         new_model = copy.deepcopy(model)
+        allowed_attention_types = set(replace_attention_types or [])
+        if replace_inside_attention and not allowed_attention_types:
+            allowed_attention_types = set(ATTENTION_TYPES)
 
         def get_layer_position(name: str) -> str:
             """Determine layer position from name."""
@@ -710,10 +727,15 @@ class YOLO26nCHTQATModel(nn.Module):
         # Counter for tracking conv layer order (to skip first N)
         conv_counter = [0]
 
-        def create_layer(module: nn.Module, name: str, parent_is_attention: bool = False) -> nn.Module:
+        def create_layer(
+            module: nn.Module,
+            name: str,
+            parent_attention_types: Optional[List[str]] = None
+        ) -> nn.Module:
             """Create CHT or QAT-CHT layer from Conv2d."""
             # Check if this module itself is an attention type
             is_attention = _is_attention_module(module)
+            parent_attention_types = parent_attention_types or []
 
             if isinstance(module, nn.Conv2d):
                 position = get_layer_position(name)
@@ -731,10 +753,13 @@ class YOLO26nCHTQATModel(nn.Module):
                     elif position == 'head' and replace_head:
                         should_replace = True
 
-                attention_submodule = parent_is_attention or is_attention or _is_inside_attention_submodule(name)
+                attention_submodule = bool(parent_attention_types) or is_attention or _is_inside_attention_submodule(name)
+                attention_replacement_allowed = any(
+                    attn_type in allowed_attention_types for attn_type in parent_attention_types
+                )
                 critical_attention_conv = _is_critical_attention_conv(name)
                 skip_attention_quantization = critical_attention_conv or (
-                    not replace_inside_attention and attention_submodule
+                    attention_submodule and not attention_replacement_allowed
                 )
 
                 # Skip replacing Conv2d inside protected attention-related submodules.
@@ -791,8 +816,14 @@ class YOLO26nCHTQATModel(nn.Module):
 
             return wrapped_any
 
-        def recursive_build(m: nn.Module, parent_name: str = '', parent_is_attention: bool = False, inside_bf16_wrapper: bool = False):
+        def recursive_build(
+            m: nn.Module,
+            parent_name: str = '',
+            parent_attention_types: Optional[List[str]] = None,
+            inside_bf16_wrapper: bool = False
+        ):
             """Recursively build model."""
+            parent_attention_types = parent_attention_types or []
             for name, child in list(m.named_children()):
                 full_name = f"{parent_name}.{name}" if parent_name else name
 
@@ -804,6 +835,7 @@ class YOLO26nCHTQATModel(nn.Module):
                 is_bf16_wrapper = isinstance(child, BF16AttentionWrapper)
                 # Check if this child is an attention module
                 is_attention_child = _is_attention_module(child)
+                child_attention_type = _get_attention_module_type(child)
 
                 # Determine if we're currently inside a BF16 wrapper (from parent context)
                 currently_inside_wrapper = inside_bf16_wrapper or is_bf16_wrapper
@@ -811,15 +843,17 @@ class YOLO26nCHTQATModel(nn.Module):
                 # Skip replacing if inside BF16 wrapper (already wrapped, don't process internal Conv2d)
                 if not currently_inside_wrapper:
                     # First, try to replace this child with CHT
-                    new_child = create_layer(child, full_name, parent_is_attention)
+                    new_child = create_layer(child, full_name, parent_attention_types)
                     if new_child is not child:
                         m.__setattr__(name, new_child)
 
                 # Then recurse into children (if it's a container)
                 # But skip recursion into BF16AttentionWrapper - it contains its own module tree
-                is_inside_attention = parent_is_attention or is_attention_child
+                child_attention_context = list(parent_attention_types)
+                if is_attention_child and child_attention_type is not None:
+                    child_attention_context.append(child_attention_type)
                 if hasattr(child, 'named_children') and not is_bf16_wrapper:
-                    recursive_build(child, full_name, is_inside_attention, currently_inside_wrapper)
+                    recursive_build(child, full_name, child_attention_context, currently_inside_wrapper)
 
         # First, replace Conv2d with CHT/QAT (including inside attention if flag is True)
         recursive_build(new_model)
@@ -1019,6 +1053,43 @@ class YOLO26nCHTQATModel(nn.Module):
 
         return total_sparsity / len(self.cht_layers)
 
+    def get_cht_weighted_sparsity(self) -> float:
+        """Get parameter-weighted sparsity across all CHT layers."""
+        if not self.cht_layers:
+            return 0.0
+
+        total_zero = 0
+        total_params = 0
+        for layer in self.cht_layers:
+            if hasattr(layer, 'mask') and layer.mask is not None:
+                active = layer.mask.sum().item()
+                total = layer.mask.numel()
+                total_zero += total - active
+                total_params += total
+
+        return (total_zero / total_params) if total_params > 0 else 0.0
+
+    def get_active_model_param_counts(self) -> Tuple[int, int]:
+        """Count params on the converted model only, excluding the stored original copy."""
+        total = sum(p.numel() for p in self._model.parameters())
+        trainable = sum(p.numel() for p in self._model.parameters() if p.requires_grad)
+        return total, trainable
+
+    def get_overall_model_sparsity(self) -> float:
+        """Estimate overall model sparsity using CHT masks over active converted-model params."""
+        total_model_params, _ = self.get_active_model_param_counts()
+        if total_model_params == 0:
+            return 0.0
+
+        total_zero = 0
+        for layer in self.cht_layers:
+            if hasattr(layer, 'mask') and layer.mask is not None:
+                active = layer.mask.sum().item()
+                total = layer.mask.numel()
+                total_zero += total - active
+
+        return total_zero / total_model_params
+
     def get_sparsity_target(self) -> float:
         """Get target sparsity from CHT layers."""
         if not self.cht_layers:
@@ -1148,6 +1219,7 @@ def load_yolo26n_cht_qat_model(
     link_update_ratio: float = 0.1,
     skip_first_n_convs: int = 2,
     replace_inside_attention: bool = True,
+    replace_attention_types: Optional[List[str]] = None,
     **cht_kwargs
 ) -> YOLO26nCHTQATModel:
     """
@@ -1164,16 +1236,24 @@ def load_yolo26n_cht_qat_model(
         link_update_ratio: Fraction of active connections to update per evolve
         skip_first_n_convs: Number of early conv layers to skip from CHT (keep dense)
         replace_inside_attention: Whether to replace Conv2d inside attention modules with CHT
+        replace_attention_types: Attention module families eligible for internal replacement
         **cht_kwargs: Additional CHT config parameters
 
     Returns:
         YOLO26nCHTQATModel with CHT + QAT
     """
+    normalized_replace_attention_types = sorted(set(replace_attention_types or []))
+    if replace_inside_attention and not normalized_replace_attention_types:
+        normalized_replace_attention_types = list(ATTENTION_TYPES)
+    if normalized_replace_attention_types:
+        replace_inside_attention = True
+
     print(f"Loading YOLO26n model from {model_path}...")
     print(f"Target sparsity: {sparsity * 100}%")
     print(f"Replace mode: {replace_mode.value}")
     print(f"Skip first {skip_first_n_convs} conv layers from CHT")
     print(f"Replace inside attention: {replace_inside_attention}")
+    print(f"Attention replacement types: {normalized_replace_attention_types if normalized_replace_attention_types else 'none'}")
     print(f"Quantization: {quantization}")
 
     # Determine which layers to replace
@@ -1240,6 +1320,7 @@ def load_yolo26n_cht_qat_model(
         enable_qat=enable_qat,
         skip_first_n_convs=skip_first_n_convs,
         replace_inside_attention=replace_inside_attention,
+        replace_attention_types=normalized_replace_attention_types,
         quantization_dtype=quantization
     )
 
@@ -1252,6 +1333,9 @@ def load_yolo26n_cht_qat_model(
 
 def count_model_params(model: nn.Module) -> Tuple[int, int]:
     """Count total and trainable parameters."""
+    if hasattr(model, 'get_active_model_param_counts'):
+        return model.get_active_model_param_counts()
+
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable

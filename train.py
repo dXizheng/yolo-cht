@@ -102,7 +102,7 @@ import math
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from yolo26n.yolo26n_cht_qat_model import load_yolo26n_cht_qat_model, count_model_params
+from yolo26n.yolo26n_cht_qat_model import ATTENTION_TYPES, load_yolo26n_cht_qat_model, count_model_params
 from yolo26n.yolo26n_config import ReplaceMode
 from yolo26n.metrics import DetectionLossReproduced
 
@@ -402,6 +402,8 @@ def parse_args():
     attention_group.add_argument('--no-replace-inside-attention', dest='replace_inside_attention', action='store_false',
                                 help='Keep Conv2d inside attention modules in floating point')
     parser.set_defaults(replace_inside_attention=False)
+    parser.add_argument('--replace-attention-types', nargs='+', choices=ATTENTION_TYPES, default=None,
+                       help='Attention module families eligible for internal replacement; implies --replace-inside-attention')
     parser.add_argument('--quantization', type=str, default='int8',
                        choices=['int8', 'fp8', 'none'],
                        help='Quantization type')
@@ -1011,13 +1013,63 @@ def validate_fallback(
     return metrics
 
 
-def draw_map_curve(map_history, best_map, args, prefix="map_curve"):
+def draw_map_curve(
+    map_history,
+    best_map,
+    args,
+    prefix="map_curve",
+    best_map_label="Best mAP@50",
+    sparsity_start_epoch=None,
+    target_reached_epoch=None,
+    sparsity_start_value=None,
+    target_reached_value=None
+):
     """Draw and save the mAP curve."""
     epochs = list(range(1, len(map_history) + 1))
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, map_history, 'b-', linewidth=2, label='mAP@50')
-    plt.axhline(y=best_map, color='r', linestyle='--', label=f'Best mAP@50: {best_map:.4f}')
+    plt.axhline(y=best_map, color='r', linestyle='--', label=f'{best_map_label}: {best_map:.4f}')
     plt.axhline(y=args.early_stop_map, color='orange', linestyle=':', label=f'Early Stop Threshold: {args.early_stop_map:.2f}')
+    if sparsity_start_epoch is not None:
+        plt.axvline(
+            x=sparsity_start_epoch,
+            color='green',
+            linestyle='-.',
+            linewidth=1.5,
+            label=f'Sparsity Applied (Epoch {sparsity_start_epoch})'
+        )
+        if sparsity_start_value is not None:
+            plt.text(
+                sparsity_start_epoch + 0.1,
+                max(map_history) * 0.92 if map_history else 0.0,
+                f"{sparsity_start_value * 100:.1f}%",
+                color='green',
+                rotation=90,
+                va='top',
+                ha='left',
+                fontsize=9,
+                bbox=dict(facecolor='white', edgecolor='green', alpha=0.7, pad=2)
+            )
+    if target_reached_epoch is not None:
+        plt.axvline(
+            x=target_reached_epoch,
+            color='purple',
+            linestyle='--',
+            linewidth=1.5,
+            label=f'Target Sparsity Reached (Epoch {target_reached_epoch})'
+        )
+        if target_reached_value is not None:
+            plt.text(
+                target_reached_epoch + 0.1,
+                max(map_history) * 0.75 if map_history else 0.0,
+                f"{target_reached_value * 100:.1f}%",
+                color='purple',
+                rotation=90,
+                va='top',
+                ha='left',
+                fontsize=9,
+                bbox=dict(facecolor='white', edgecolor='purple', alpha=0.7, pad=2)
+            )
     plt.xlabel('Epoch', fontsize=12)
     plt.ylabel('mAP@50', fontsize=12)
     plt.title('mAP@50 vs Epoch', fontsize=14)
@@ -1050,6 +1102,8 @@ def save_checkpoint(model, args, epoch, save_path, run_metadata=None):
         'model_state_dict': model.state_dict(),
         'epoch': epoch,
         'sparsity': model.get_sparsity(),
+        'cht_weighted_sparsity': model.get_cht_weighted_sparsity() if hasattr(model, 'get_cht_weighted_sparsity') else None,
+        'overall_model_sparsity': model.get_overall_model_sparsity() if hasattr(model, 'get_overall_model_sparsity') else None,
         'target_sparsity': model.get_sparsity_target(),
         'cht_layers_count': model.get_num_cht_layers(),
         'replace_mode': args.replace_mode,
@@ -1083,6 +1137,10 @@ def save_checkpoint(model, args, epoch, save_path, run_metadata=None):
     # Announce checkpoint with quantization info
     print(f"\n  Checkpoint saved: {save_path}")
     print(f"    Epoch: {epoch}, Sparsity: {checkpoint['sparsity']*100:.1f}% (target: {checkpoint['target_sparsity']*100:.1f}%)")
+    if checkpoint.get('cht_weighted_sparsity') is not None:
+        print(f"    CHT weighted sparsity: {checkpoint['cht_weighted_sparsity']*100:.1f}%")
+    if checkpoint.get('overall_model_sparsity') is not None:
+        print(f"    Overall model sparsity: {checkpoint['overall_model_sparsity']*100:.1f}%")
     print(f"    CHT layers: {checkpoint['cht_layers_count']}, QAT layers: {checkpoint['qat_layers_count']}")
     print(f"    Quantization: {checkpoint['quantization']} (enabled: {checkpoint['qat_enabled']})")
     print(f"    BF16 attention: {checkpoint['bf16_attention_count']} modules, {checkpoint.get('bf16_param_count', 0):,} params")
@@ -1151,7 +1209,9 @@ def main():
     print(f"Sparsity warmup: {args.sparsity_warmup} epochs")
     print(f"Sparsity step: every {args.sparsity_step} epochs (+{args.sparsity_step_size*100}%)")
     print(f"Replace mode: {args.replace_mode}")
-    print(f"Replace inside attention: {args.replace_inside_attention}")
+    effective_replace_inside_attention = args.replace_inside_attention or bool(args.replace_attention_types)
+    print(f"Replace inside attention: {effective_replace_inside_attention}")
+    print(f"Attention replacement types: {args.replace_attention_types if args.replace_attention_types else 'none'}")
     print(f"Unfreeze all params: {args.unfreeze_all}")
     print(f"Quantization: {args.quantization}")
     print(f"Loss: Ultralytics v8DetectionLoss (native)")
@@ -1257,7 +1317,8 @@ def main():
         soft=True,
         link_update_ratio=link_update_ratio,
         skip_first_n_convs=args.skip_first_convs,
-        replace_inside_attention=args.replace_inside_attention,
+        replace_inside_attention=effective_replace_inside_attention,
+        replace_attention_types=args.replace_attention_types,
         sparsity_schedule=args.sparsity_schedule,
         sparsity_warmup_epochs=sparsity_warmup,
         sparsity_step_epochs=sparsity_step,
@@ -1368,6 +1429,10 @@ def main():
     target_sparsity = model.get_sparsity_target()
     best_map_at_target_sparsity = float('-inf')
     target_sparsity_reached = False
+    sparsity_start_epoch = None
+    target_reached_epoch = None
+    sparsity_start_value = None
+    target_reached_value = None
 
     # Validate at baseline (epoch 0) before training starts
     print("\n  Validating at baseline (epoch 0)...")
@@ -1416,9 +1481,18 @@ def main():
 
         # Evolve CHT layers (sparsity) - only after warmup to avoid destabilizing training
         if epoch > args.sparsity_warmup:
+            if sparsity_start_epoch is None:
+                sparsity_start_epoch = epoch
             print(f"\n  Evolving CHT layers at epoch {epoch}...")
             evolve_stats = model.evolve(current_epoch=epoch, verbose=False)
-            print(f"  Sparsity after evolution: {model.get_sparsity() * 100:.2f}%")
+            current_sparsity_after_evolve = model.get_sparsity()
+            current_cht_weighted_sparsity = model.get_cht_weighted_sparsity() if hasattr(model, 'get_cht_weighted_sparsity') else current_sparsity_after_evolve
+            current_overall_model_sparsity = model.get_overall_model_sparsity() if hasattr(model, 'get_overall_model_sparsity') else 0.0
+            if sparsity_start_value is None:
+                sparsity_start_value = current_sparsity_after_evolve
+            print(f"  Sparsity after evolution: {current_sparsity_after_evolve * 100:.2f}%")
+            print(f"  CHT weighted sparsity: {current_cht_weighted_sparsity * 100:.2f}%")
+            print(f"  Overall model sparsity: {current_overall_model_sparsity * 100:.2f}%")
         else:
             print(f"\n  Skipping evolve during warmup (epoch {epoch}/{args.sparsity_warmup})")
 
@@ -1449,6 +1523,8 @@ def main():
         target_reached_now = current_sparsity >= max(0.0, target_sparsity - 1e-6)
         if target_reached_now and not target_sparsity_reached:
             target_sparsity_reached = True
+            target_reached_epoch = epoch
+            target_reached_value = current_sparsity
             print(f"  Target sparsity reached: {current_sparsity * 100:.2f}%")
 
         if target_reached_now and val_metrics['mAP50'] > best_map_at_target_sparsity:
@@ -1478,7 +1554,16 @@ def main():
         # If early stopping triggered, break and save the curve
         if early_stop_triggered:
             print("\nEarly stopping triggered! Saving mAP curve...")
-            draw_map_curve(map_history, best_map, args, prefix="map_curve_early_stop")
+            draw_map_curve(
+                map_history,
+                best_map,
+                args,
+                prefix="map_curve_early_stop",
+                sparsity_start_epoch=sparsity_start_epoch,
+                target_reached_epoch=target_reached_epoch,
+                sparsity_start_value=sparsity_start_value,
+                target_reached_value=target_reached_value
+            )
 
             # Save checkpoint before stopping
             save_path = get_weights_dir(args) / 'early_stop.pt'
@@ -1491,16 +1576,34 @@ def main():
             return log_path
 
     print("\nTraining completed!")
-    print(f"Best mAP@50: {best_map:.4f}")
+    display_best_map = best_map_at_target_sparsity if best_map_at_target_sparsity > float('-inf') else best_map
+    display_best_map_label = (
+        "Best mAP@50 After Target Sparsity"
+        if best_map_at_target_sparsity > float('-inf')
+        else "Best mAP@50"
+    )
+    print(f"{display_best_map_label}: {display_best_map:.4f}")
     print(f"Final sparsity: {model.get_sparsity() * 100:.2f}%")
-    if best_map_at_target_sparsity > float('-inf'):
-        print(f"Best mAP@50 at target sparsity: {best_map_at_target_sparsity:.4f}")
-    else:
+    if hasattr(model, 'get_cht_weighted_sparsity'):
+        print(f"Final CHT weighted sparsity: {model.get_cht_weighted_sparsity() * 100:.2f}%")
+    if hasattr(model, 'get_overall_model_sparsity'):
+        print(f"Final overall model sparsity: {model.get_overall_model_sparsity() * 100:.2f}%")
+    if best_map_at_target_sparsity == float('-inf'):
         print("Best mAP@50 at target sparsity: target not reached during this run")
 
     # Prepare quant folder for saving
     # Plot mAP curve (reuse the draw function)
-    draw_map_curve(map_history, best_map, args, prefix="map_curve")
+    draw_map_curve(
+        map_history,
+        display_best_map,
+        args,
+        prefix="map_curve",
+        best_map_label=display_best_map_label,
+        sparsity_start_epoch=sparsity_start_epoch,
+        target_reached_epoch=target_reached_epoch,
+        sparsity_start_value=sparsity_start_value,
+        target_reached_value=target_reached_value
+    )
 
     # Save final model with CHT metadata
     save_path = get_weights_dir(args) / 'last.pt'

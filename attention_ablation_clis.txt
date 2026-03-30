@@ -1,0 +1,61 @@
+YOLO Attention Replacement Ablation CLIs
+Workspace: E:\chip\YOLO_trial\yolo26n
+Device: cuda:1
+Epochs: 20
+
+Control, no attention-internal replacement
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --no-replace-inside-attention --validation-mode native --allow-dirty --name control_no_attention_replace
+
+All supported attention families, QAT only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.0 --skip-first-convs 2 --replace-inside-attention --validation-mode native --allow-dirty --name attn_all_qat_only
+
+All supported attention families, sparsity only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization none --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-inside-attention --validation-mode native --allow-dirty --name attn_all_sparse_only
+
+All supported attention families, QAT plus sparsity
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-inside-attention --validation-mode native --allow-dirty --name attn_all_qat_and_sparse
+
+C3k2 only, QAT only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.0 --skip-first-convs 2 --replace-attention-types C3k2 --validation-mode native --allow-dirty --name attn_c3k2_qat_only
+
+C3k2 only, sparsity only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization none --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-attention-types C3k2 --validation-mode native --allow-dirty --name attn_c3k2_sparse_only
+
+C3k2 only, QAT plus sparsity
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-attention-types C3k2 --validation-mode native --allow-dirty --name attn_c3k2_qat_and_sparse
+
+C2PSA only, QAT only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.0 --skip-first-convs 2 --replace-attention-types C2PSA --validation-mode native --allow-dirty --name attn_c2psa_qat_only
+
+C2PSA only, sparsity only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization none --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-attention-types C2PSA --validation-mode native --allow-dirty --name attn_c2psa_sparse_only
+
+C2PSA only, QAT plus sparsity
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-attention-types C2PSA --validation-mode native --allow-dirty --name attn_c2psa_qat_and_sparse
+
+C2f only, QAT only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.0 --skip-first-convs 2 --replace-attention-types C2f --validation-mode native --allow-dirty --name attn_c2f_qat_only
+
+C2f only, sparsity only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization none --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-attention-types C2f --validation-mode native --allow-dirty --name attn_c2f_sparse_only
+
+C2f only, QAT plus sparsity
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-attention-types C2f --validation-mode native --allow-dirty --name attn_c2f_qat_and_sparse
+
+PSABlock only, QAT only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.0 --skip-first-convs 2 --replace-attention-types PSABlock --validation-mode native --allow-dirty --name attn_psablock_qat_only
+
+PSABlock only, sparsity only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization none --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-attention-types PSABlock --validation-mode native --allow-dirty --name attn_psablock_sparse_only
+
+PSABlock only, QAT plus sparsity
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-attention-types PSABlock --validation-mode native --allow-dirty --name attn_psablock_qat_and_sparse
+
+Attention only, QAT only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.0 --skip-first-convs 2 --replace-attention-types Attention --validation-mode native --allow-dirty --name attn_attention_qat_only
+
+Attention only, sparsity only
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization none --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-attention-types Attention --validation-mode native --allow-dirty --name attn_attention_sparse_only
+
+Attention only, QAT plus sparsity
+python train.py --model yolo26n.pt --data coco128.yaml --epochs 20 --batch-size 16 --imgsz 640 --device cuda:1 --quantization int8 --replace-mode backbone_neck --sparsity 0.5 --sparsity-schedule step --sparsity-warmup 3 --sparsity-step 1 --sparsity-step-size 0.1 --skip-first-convs 2 --replace-attention-types Attention --validation-mode native --allow-dirty --name attn_attention_qat_and_sparse

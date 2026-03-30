@@ -22,18 +22,39 @@ import matplotlib.pyplot as plt
 import sys
 from datetime import datetime
 from pathlib import Path
+import hashlib
+import json
+import subprocess
+from importlib import metadata as importlib_metadata
 
 # Global log file handle
 _log_file = None
 _log_path = None
+_run_metadata = None
+
+
+def get_run_root(args):
+    """Return the root directory for a run."""
+    quant_folder = args.quantization if args.quantization != 'none' else 'fp32'
+    freeze_folder = "unfreeze_all" if args.unfreeze_all else "freeze"
+    return Path(args.project) / args.name / quant_folder / args.replace_mode / freeze_folder / args.optimizer
+
+
+def get_logs_dir(args):
+    """Return the log directory for a run."""
+    return get_run_root(args) / 'logs'
+
+
+def get_weights_dir(args):
+    """Return the weights directory for a run."""
+    return get_run_root(args) / 'weights'
 
 def setup_logging(args):
     """Set up logging to file in addition to console output."""
     global _log_file, _log_path
 
     # Create log directory
-    quant_folder = args.quantization if args.quantization != 'none' else 'fp32'
-    log_dir = Path(args.project) / args.name / quant_folder / args.replace_mode / args.optimizer / 'logs'
+    log_dir = get_logs_dir(args)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Create unique log filename with timestamp
@@ -84,6 +105,244 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from yolo26n.yolo26n_cht_qat_model import load_yolo26n_cht_qat_model, count_model_params
 from yolo26n.yolo26n_config import ReplaceMode
 from yolo26n.metrics import DetectionLossReproduced
+
+
+def _to_serializable(value):
+    """Convert nested objects into JSON/YAML serializable values."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, torch.device):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _to_serializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_serializable(v) for v in value]
+    return value
+
+
+def _run_subprocess(command):
+    """Run a subprocess command and return stripped stdout."""
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=Path(__file__).parent
+    )
+    return result.stdout.strip()
+
+
+def collect_git_metadata():
+    """Collect git commit, branch, and worktree cleanliness."""
+    metadata = {
+        'commit': None,
+        'branch': None,
+        'is_dirty': None,
+        'status': None,
+        'available': False,
+    }
+    try:
+        metadata['commit'] = _run_subprocess(['git', 'rev-parse', 'HEAD'])
+        metadata['branch'] = _run_subprocess(['git', 'branch', '--show-current'])
+        status = _run_subprocess(['git', 'status', '--porcelain'])
+        metadata['status'] = status
+        metadata['is_dirty'] = bool(status)
+        metadata['available'] = True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        metadata['status'] = 'git metadata unavailable'
+    return metadata
+
+
+def collect_package_versions():
+    """Collect versions for the packages most relevant to reproducibility."""
+    packages = ['torch', 'torchvision', 'ultralytics', 'numpy', 'opencv-python', 'matplotlib', 'PyYAML']
+    versions = {}
+    for package in packages:
+        try:
+            versions[package] = importlib_metadata.version(package)
+        except importlib_metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
+
+
+def resolve_dataset_paths(data_yaml):
+    """Resolve train/val image roots from a dataset YAML."""
+    data_yaml = Path(data_yaml).resolve()
+    with open(data_yaml, encoding='utf-8') as f:
+        data_cfg = yaml.safe_load(f)
+
+    base_path = Path(data_cfg.get('path', '')) if data_cfg.get('path') else data_yaml.parent
+    if not base_path.is_absolute():
+        base_path = (data_yaml.parent / base_path).resolve()
+
+    def _resolve_entry(key):
+        entry = data_cfg.get(key)
+        if entry is None:
+            return None
+        entry_path = Path(entry)
+        if entry_path.is_absolute():
+            return entry_path
+        return (base_path / entry_path).resolve()
+
+    return data_cfg, {
+        'yaml_path': data_yaml,
+        'base_path': base_path,
+        'train': _resolve_entry('train'),
+        'val': _resolve_entry('val'),
+    }
+
+
+def build_split_manifest(split_name, image_root):
+    """Build a deterministic manifest for one dataset split."""
+    image_root = Path(image_root)
+    manifest = {
+        'split': split_name,
+        'image_root': str(image_root),
+        'file_count': 0,
+        'sha256': None,
+        'entries': [],
+    }
+
+    if not image_root.exists():
+        manifest['missing'] = True
+        manifest['sha256'] = hashlib.sha256(f'missing:{image_root}'.encode('utf-8')).hexdigest()
+        return manifest
+
+    image_files = sorted(
+        [p for p in image_root.rglob('*') if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}]
+    )
+
+    lines = []
+    for image_file in image_files:
+        rel_image = image_file.relative_to(image_root).as_posix()
+        image_size = image_file.stat().st_size
+        label_root = image_root.parent.parent / 'labels' / image_root.name
+        label_file = (label_root / image_file.relative_to(image_root)).with_suffix('.txt')
+        label_exists = label_file.exists()
+        label_rel = label_file.relative_to(label_root).as_posix() if label_exists else ''
+        label_size = label_file.stat().st_size if label_exists else 0
+        line = f"{rel_image}|{image_size}|{label_rel}|{label_size}"
+        lines.append(line)
+
+    manifest_text = '\n'.join(lines)
+    manifest['file_count'] = len(lines)
+    manifest['sha256'] = hashlib.sha256(manifest_text.encode('utf-8')).hexdigest()
+    manifest['entries'] = lines
+    return manifest
+
+
+def write_dataset_manifests(args, data_yaml):
+    """Write dataset split manifests and return summary metadata."""
+    run_root = get_run_root(args)
+    manifest_dir = run_root / 'manifests'
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+
+    data_cfg, resolved = resolve_dataset_paths(data_yaml)
+    summary = {
+        'data_yaml': str(resolved['yaml_path']),
+        'base_path': str(resolved['base_path']),
+        'train': None,
+        'val': None,
+    }
+
+    for split_name in ('train', 'val'):
+        split_root = resolved.get(split_name)
+        if split_root is None:
+            continue
+        manifest = build_split_manifest(split_name, split_root)
+        manifest_path = manifest_dir / f'{split_name}_manifest.txt'
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            if manifest['entries']:
+                f.write('\n'.join(manifest['entries']) + '\n')
+        summary[split_name] = {
+            'root': str(split_root),
+            'manifest_path': str(manifest_path),
+            'sha256': manifest['sha256'],
+            'file_count': manifest['file_count'],
+            'missing': manifest.get('missing', False),
+        }
+
+    data_cfg_path = manifest_dir / 'dataset_config_snapshot.yaml'
+    with open(data_cfg_path, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(_to_serializable(data_cfg), f, sort_keys=True)
+    summary['dataset_config_snapshot'] = str(data_cfg_path)
+    return summary
+
+
+def build_run_metadata(args, device, cht_config, resolved_config, git_metadata, dataset_metadata):
+    """Build a reproducibility metadata payload for the run."""
+    return {
+        'timestamp': datetime.now().isoformat(),
+        'args': _to_serializable(vars(args)),
+        'device': str(device),
+        'validation_mode': args.validation_mode,
+        'git': git_metadata,
+        'cht_config_loaded': _to_serializable(cht_config),
+        'resolved_config': _to_serializable(resolved_config),
+        'dataset': _to_serializable(dataset_metadata),
+        'package_versions': collect_package_versions(),
+    }
+
+
+def persist_run_metadata(args, run_metadata):
+    """Persist run metadata to the run directory."""
+    run_root = get_run_root(args)
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    json_path = run_root / 'run_metadata.json'
+    yaml_path = run_root / 'run_metadata.yaml'
+
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(run_metadata, f, indent=2, sort_keys=True)
+
+    with open(yaml_path, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(run_metadata, f, sort_keys=True)
+
+    return json_path, yaml_path
+
+
+def enforce_clean_worktree(args, git_metadata):
+    """Require a clean worktree for benchmark runs unless explicitly overridden."""
+    if args.allow_dirty or args.validation_mode != 'native':
+        return
+    if not git_metadata.get('available'):
+        raise RuntimeError("Benchmark runs require git metadata, but git is unavailable.")
+    if git_metadata.get('is_dirty'):
+        raise RuntimeError(
+            "Benchmark runs require a clean worktree. Commit/stash your changes or rerun with --allow-dirty."
+        )
+
+
+def load_cht_config(config_name='baseline', config_path=None):
+    """
+    Load CHT configuration from YAML file.
+
+    Args:
+        config_name: 'baseline' or 'optimized'
+        config_path: Custom config file path (overrides config_name)
+
+    Returns:
+        Dictionary with CHT configuration parameters
+    """
+    if config_path is None:
+        # Use built-in config files
+        base_dir = Path(__file__).parent
+        if config_name == 'baseline':
+            config_path = base_dir / 'config_baseline.yaml'
+        elif config_name == 'optimized':
+            config_path = base_dir / 'config_optimized.yaml'
+        else:
+            raise ValueError(f"Unknown config name: {config_name}")
+
+    if not Path(config_path).exists():
+        print(f"Warning: Config file {config_path} not found, using default values")
+        return {}
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    print(f"Loaded CHT config: {config_path}")
+    return config
 
 
 def _default_collate_fn(batch):
@@ -137,8 +396,12 @@ def parse_args():
                        help='Which layers to replace with CHT')
     parser.add_argument('--skip-first-convs', type=int, default=2,
                        help='Number of early conv layers to skip from CHT (keep dense)')
-    parser.add_argument('--replace-inside-attention', action='store_true', default=True,
-                       help='Replace Conv2d inside attention modules with CHT or QAT')
+    attention_group = parser.add_mutually_exclusive_group()
+    attention_group.add_argument('--replace-inside-attention', dest='replace_inside_attention', action='store_true',
+                                help='Replace Conv2d inside attention modules with CHT or QAT')
+    attention_group.add_argument('--no-replace-inside-attention', dest='replace_inside_attention', action='store_false',
+                                help='Keep Conv2d inside attention modules in floating point')
+    parser.set_defaults(replace_inside_attention=False)
     parser.add_argument('--quantization', type=str, default='int8',
                        choices=['int8', 'fp8', 'none'],
                        help='Quantization type')
@@ -161,12 +424,24 @@ def parse_args():
     parser.add_argument('--optimizer', type=str, default='sgd',
                        choices=['sgd', 'muon', 'adamw'],
                        help='Optimizer: sgd (default), muon (Muon for weights + AdamW for biases)')
+    parser.add_argument('--config', type=str, default='baseline',
+                       choices=['baseline', 'optimized'],
+                       help='CHT config to use: baseline (original) or optimized (with CHTss)')
+    parser.add_argument('--cht-config', type=str, default=None,
+                       help='Path to custom CHT config YAML file')
     parser.add_argument('--lr', type=float, default=0.01,
                        help='Learning rate for SGD, muon uses 0.02')
     parser.add_argument('--momentum', type=float, default=0.937,
                        help='Momentum for SGD (default: 0.937)')
     parser.add_argument('--weight-decay', type=float, default=0.0005,
                        help='Weight decay (default: 0.0005)')
+    parser.add_argument('--early-stop-map', type=float, default=0.2,
+                       help='Early stopping threshold: stop training if mAP@50 falls below this value')
+    parser.add_argument('--validation-mode', type=str, default='native',
+                       choices=['native', 'fallback', 'auto'],
+                       help='Validation path: native is reproducible default, fallback is debug-only, auto falls back on native errors')
+    parser.add_argument('--allow-dirty', action='store_true',
+                       help='Allow running benchmark training from a dirty git worktree')
     return parser.parse_args()
 
 
@@ -512,6 +787,8 @@ def train_one_epoch(
     num_batches = 0
 
     for batch_idx, batch in enumerate(dataloader):
+        optimizer.zero_grad(set_to_none=True)
+
         # Handle both formats (Ultralytics returns different format)
         if isinstance(batch, dict):
             # New Ultralytics format: batch is a dict with 'img', 'bboxes', 'cls', 'batch_idx' keys
@@ -579,7 +856,6 @@ def train_one_epoch(
         # Check for NaN/Inf before backward
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"Warning: NaN/Inf detected at batch {batch_idx}, skipping...")
-            optimizer.zero_grad()
             continue
 
         # Backward pass with gradient clipping
@@ -630,7 +906,9 @@ def validate(
     imgsz=640,
     batch_size=16,
     verbose=True,
-    conf_threshold=0.001
+    conf_threshold=0.001,
+    quantization='int8',
+    validation_mode='native'
 ):
     """
     Validate model using Ultralytics native validation (yolo.val()).
@@ -652,6 +930,14 @@ def validate(
     # Create a YOLO wrapper for validation
     # We use the model directly - Ultralytics val() will handle the forward pass
     model.eval()
+
+    # Native validation works for all quantization settings including 'none'
+    # (tested on both coco128 and coco5000 datasets)
+
+    if validation_mode == 'fallback':
+        metrics = validate_fallback(model, device, data_yaml, imgsz, batch_size, verbose, conf_threshold=conf_threshold)
+        model.train()
+        return metrics
 
     # Try to use native Ultralytics validation
     try:
@@ -687,7 +973,9 @@ def validate(
         if verbose:
             print(f"  Validation: mAP@50={map50:.4f}, mAP@50:0.95={map50_95:.4f}")
 
-    except (RuntimeError, ValueError, AttributeError, TypeError) as e:
+    except (AttributeError, RuntimeError, TypeError, ValueError, OSError, IOError) as e:
+        if validation_mode == 'native':
+            raise RuntimeError(f"Native validation failed in benchmark mode: {e}") from e
         print(f"  Native validation failed: {e}")
         print("  Using fallback validation...")
         metrics = validate_fallback(model, device, data_yaml, imgsz, batch_size, verbose, conf_threshold=conf_threshold)
@@ -723,7 +1011,32 @@ def validate_fallback(
     return metrics
 
 
-def save_checkpoint(model, args, epoch, save_path):
+def draw_map_curve(map_history, best_map, args, prefix="map_curve"):
+    """Draw and save the mAP curve."""
+    epochs = list(range(1, len(map_history) + 1))
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, map_history, 'b-', linewidth=2, label='mAP@50')
+    plt.axhline(y=best_map, color='r', linestyle='--', label=f'Best mAP@50: {best_map:.4f}')
+    plt.axhline(y=args.early_stop_map, color='orange', linestyle=':', label=f'Early Stop Threshold: {args.early_stop_map:.2f}')
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('mAP@50', fontsize=12)
+    plt.title('mAP@50 vs Epoch', fontsize=14)
+    plt.legend(loc='lower right')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    # Save plot
+    quant_folder = args.quantization if args.quantization != 'none' else 'fp32'
+    freeze_folder = "unfreeze_all" if args.unfreeze_all else "freeze"
+    plot_path = Path(args.project) / args.name / quant_folder / args.replace_mode / freeze_folder / args.optimizer / 'weights' / f'{prefix}.png'
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"\n{prefix.replace('_', ' ').title()} saved to: {plot_path}")
+    return plot_path
+
+
+def save_checkpoint(model, args, epoch, save_path, run_metadata=None):
     """Save a checkpoint with CHT layer information."""
     # Collect quantization info
     bf16_attention_count = model.get_num_bf16_attention_modules() if hasattr(model, 'get_num_bf16_attention_modules') else 0
@@ -746,6 +1059,8 @@ def save_checkpoint(model, args, epoch, save_path):
         'bf16_attention_count': bf16_attention_count,
         'bf16_param_count': bf16_param_count,
     }
+    if run_metadata is not None:
+        checkpoint['run_metadata'] = run_metadata
 
     # Add CHT layer details if available
     if hasattr(model, 'cht_layers') and model.cht_layers:
@@ -841,7 +1156,8 @@ def main():
     print(f"Quantization: {args.quantization}")
     print(f"Loss: Ultralytics v8DetectionLoss (native)")
     print(f"Optimizer: SGD (Ultralytics standard)")
-    print(f"Validation: Ultralytics native (yolo.val())")
+    print(f"Validation mode: {args.validation_mode}")
+    print(f"Early stopping: mAP@50 < {args.early_stop_map:.2f}")
     print("=" * 60)
 
     # Set device - check if the requested device is actually available
@@ -865,6 +1181,9 @@ def main():
         device = torch.device('cpu')
     print(f"\nUsing device: {device}")
 
+    git_metadata = collect_git_metadata()
+    enforce_clean_worktree(args, git_metadata)
+
     # Convert replace mode
     if args.replace_mode == 'backbone':
         replace_mode = ReplaceMode.BACKBONE
@@ -872,6 +1191,59 @@ def main():
         replace_mode = ReplaceMode.BACKBONE_NECK
     else:
         replace_mode = ReplaceMode.ALL
+
+    # Load CHT config
+    cht_config = load_cht_config(args.config, args.cht_config)
+
+    # Extract config values (CLI args override config file if provided)
+    link_update_ratio = cht_config.get('link_update_ratio', 0.1)
+    evolve_duration = cht_config.get('ss_duration', 0)
+    evolve_speed = cht_config.get('ss_k', 0.1)
+    delta = cht_config.get('delta', 0.3)
+    delta_max = cht_config.get('delta_max', 0.5)
+    delta_d = cht_config.get('delta_d', 0.01)
+    delta_remove = cht_config.get('delta_remove', 0.5)
+    sparsity_warmup = cht_config.get('sparsity_warmup_epochs', args.sparsity_warmup)
+    sparsity_step = cht_config.get('sparsity_step_epochs', args.sparsity_step)
+    sparsity_step_size = cht_config.get('sparsity_step_size', args.sparsity_step_size)
+
+    # Print config info
+    print(f"\nCHT Configuration ({args.config}):")
+    print(f"  link_update_ratio: {link_update_ratio}")
+    print(f"  evolve_duration (CHTss): {evolve_duration}")
+    print(f"  evolve_speed: {evolve_speed}")
+    print(f"  delta: {delta}, delta_max: {delta_max}, delta_d: {delta_d}")
+    print(f"  sparsity_warmup_epochs: {sparsity_warmup}")
+    print(f"  sparsity_step_epochs: {sparsity_step}")
+    print(f"  sparsity_step_size: {sparsity_step_size}")
+
+    resolved_config = {
+        'replace_mode': replace_mode.value,
+        'link_update_ratio': link_update_ratio,
+        'evolve_duration': evolve_duration,
+        'evolve_speed': evolve_speed,
+        'delta': delta,
+        'delta_max': delta_max,
+        'delta_d': delta_d,
+        'delta_remove': delta_remove,
+        'sparsity_warmup_epochs': sparsity_warmup,
+        'sparsity_step_epochs': sparsity_step,
+        'sparsity_step_size': sparsity_step_size,
+    }
+
+    dataset_metadata = write_dataset_manifests(args, args.data)
+    run_metadata = build_run_metadata(args, device, cht_config, resolved_config, git_metadata, dataset_metadata)
+    metadata_json_path, metadata_yaml_path = persist_run_metadata(args, run_metadata)
+    global _run_metadata
+    _run_metadata = run_metadata
+
+    print("\nReproducibility Metadata:")
+    print(f"  Git commit: {git_metadata.get('commit')}")
+    print(f"  Git branch: {git_metadata.get('branch')}")
+    print(f"  Worktree dirty: {git_metadata.get('is_dirty')}")
+    print(f"  Train manifest SHA256: {dataset_metadata.get('train', {}).get('sha256') if dataset_metadata.get('train') else 'n/a'}")
+    print(f"  Val manifest SHA256: {dataset_metadata.get('val', {}).get('sha256') if dataset_metadata.get('val') else 'n/a'}")
+    print(f"  Run metadata: {metadata_json_path}")
 
     # Load model
     print("\nLoading model...")
@@ -883,19 +1255,26 @@ def main():
         regrow_method="L3n",
         shared_mask_sw=True,
         soft=True,
-        link_update_ratio=0.08,
+        link_update_ratio=link_update_ratio,
         skip_first_n_convs=args.skip_first_convs,
         replace_inside_attention=args.replace_inside_attention,
         sparsity_schedule=args.sparsity_schedule,
-        sparsity_warmup_epochs=args.sparsity_warmup,
-        sparsity_step_epochs=args.sparsity_step,
-        sparsity_step_size=args.sparsity_step_size
+        sparsity_warmup_epochs=sparsity_warmup,
+        sparsity_step_epochs=sparsity_step,
+        sparsity_step_size=sparsity_step_size,
+        # Additional CHT config from YAML
+        evolve_duration=evolve_duration,
+        evolve_speed=evolve_speed,
+        delta=delta,
+        delta_max=delta_max,
+        delta_d=delta_d,
+        delta_remove=delta_remove
     )
 
     # Unfreeze all parameters if requested
     if args.unfreeze_all:
         print("\nUnfreezing all parameters...")
-        for p in model._model.parameters():
+        for p in model.parameters():
             p.requires_grad = True
 
     # Count parameters
@@ -983,11 +1362,32 @@ def main():
     # lr = lr0 * (1 - cos(pi * epoch / epochs)) / 2
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0.0001)
 
+    # Initialize tracking variables
+    map_history = []  # Track mAP@50 for each epoch
+    best_map = 0.0
+    target_sparsity = model.get_sparsity_target()
+    best_map_at_target_sparsity = float('-inf')
+    target_sparsity_reached = False
+
+    # Validate at baseline (epoch 0) before training starts
+    print("\n  Validating at baseline (epoch 0)...")
+    val_metrics = validate(
+        model, device,
+        data_yaml=args.data,
+        imgsz=args.imgsz,
+        batch_size=args.batch_size,
+        verbose=args.verbose,
+        conf_threshold=0.001,
+        quantization=args.quantization,
+        validation_mode=args.validation_mode
+    )
+    print(f"  Baseline mAP@50: {val_metrics['mAP50']:.4f}, mAP@50:95: {val_metrics['mAP50-95']:.4f}")
+    map_history.append(val_metrics['mAP50'])
+    best_map = val_metrics['mAP50']
+
     # Training loop
     print("\nStarting training...")
     print(f"Warmup: {warmup_epochs} epochs")
-    best_map = 0.0
-    map_history = []  # Track mAP@50 for each epoch
 
     # Warmup settings - use optimizer-specific base LR
     if args.optimizer == 'sgd':
@@ -1031,22 +1431,42 @@ def main():
             imgsz=args.imgsz,
             batch_size=args.batch_size,
             verbose=args.verbose,
-            conf_threshold=0.001
+            conf_threshold=0.001,
+            quantization=args.quantization,
+            validation_mode=args.validation_mode
         )
 
         # Save best model based on mAP
         map_history.append(val_metrics['mAP50'])
         if val_metrics['mAP50'] > best_map:
             best_map = val_metrics['mAP50']
+            best_path = get_weights_dir(args) / 'best.pt'
+            best_path.parent.mkdir(parents=True, exist_ok=True)
+            save_checkpoint(model, args, epoch, best_path, run_metadata=run_metadata)
             print(f"  New best mAP@50: {best_map:.4f}")
 
-        # Save periodic checkpoint
-        if args.save_period > 0 and epoch % args.save_period == 0:
-            # Create subfolder based on quantization type, replace mode, and optimizer
-            quant_folder = args.quantization if args.quantization != 'none' else 'fp32'
-            checkpoint_path = Path(args.project) / args.name / quant_folder / args.replace_mode / args.optimizer / 'weights' / f'epoch_{epoch}.pt'
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            save_checkpoint(model, args, epoch, checkpoint_path)
+        current_sparsity = model.get_sparsity()
+        target_reached_now = current_sparsity >= max(0.0, target_sparsity - 1e-6)
+        if target_reached_now and not target_sparsity_reached:
+            target_sparsity_reached = True
+            print(f"  Target sparsity reached: {current_sparsity * 100:.2f}%")
+
+        if target_reached_now and val_metrics['mAP50'] > best_map_at_target_sparsity:
+            best_map_at_target_sparsity = val_metrics['mAP50']
+            best_target_path = get_weights_dir(args) / 'best_target_sparsity.pt'
+            best_target_path.parent.mkdir(parents=True, exist_ok=True)
+            save_checkpoint(model, args, epoch, best_target_path, run_metadata=run_metadata)
+            print(
+                f"  New best mAP@50 at target sparsity: {best_map_at_target_sparsity:.4f} "
+                f"(sparsity {current_sparsity * 100:.2f}%)"
+            )
+
+        # Early stopping check: stop if mAP@50 falls below threshold
+        early_stop_triggered = False
+        if val_metrics['mAP50'] < args.early_stop_map:
+            print(f"\n*** EARLY STOPPING TRIGGERED ***")
+            print(f"  mAP@50 ({val_metrics['mAP50']:.4f}) fell below threshold ({args.early_stop_map:.2f})")
+            early_stop_triggered = True
 
         # Update scheduler only after warmup (to avoid conflict with warmup LR)
         if epoch > warmup_epochs:
@@ -1055,36 +1475,37 @@ def main():
         print(f"\nEpoch {epoch}/{args.epochs} completed")
         print(f"  Loss: {train_metrics['loss']:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
 
+        # If early stopping triggered, break and save the curve
+        if early_stop_triggered:
+            print("\nEarly stopping triggered! Saving mAP curve...")
+            draw_map_curve(map_history, best_map, args, prefix="map_curve_early_stop")
+
+            # Save checkpoint before stopping
+            save_path = get_weights_dir(args) / 'early_stop.pt'
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_checkpoint(model, args, epoch, save_path, run_metadata=run_metadata)
+
+            # Close log file
+            close_logging()
+            print(f"\nLog saved to: {log_path}")
+            return log_path
+
     print("\nTraining completed!")
     print(f"Best mAP@50: {best_map:.4f}")
     print(f"Final sparsity: {model.get_sparsity() * 100:.2f}%")
+    if best_map_at_target_sparsity > float('-inf'):
+        print(f"Best mAP@50 at target sparsity: {best_map_at_target_sparsity:.4f}")
+    else:
+        print("Best mAP@50 at target sparsity: target not reached during this run")
 
     # Prepare quant folder for saving
-    quant_folder = args.quantization if args.quantization != 'none' else 'fp32'
-
-    # Plot mAP curve
-    epochs = list(range(1, len(map_history) + 1))
-    plt.figure(figsize=(10, 6))
-    plt.plot(epochs, map_history, 'b-', linewidth=2, label='mAP@50')
-    plt.axhline(y=best_map, color='r', linestyle='--', label=f'Best mAP@50: {best_map:.4f}')
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('mAP@50', fontsize=12)
-    plt.title('mAP@50 vs Epoch', fontsize=14)
-    plt.legend(loc='lower right')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-
-    # Save plot
-    plot_path = Path(args.project) / args.name / quant_folder / args.replace_mode / args.optimizer / 'weights' / 'map_curve.png'
-    plot_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(plot_path, dpi=150)
-    plt.close()
-    print(f"\nmAP curve saved to: {plot_path}")
+    # Plot mAP curve (reuse the draw function)
+    draw_map_curve(map_history, best_map, args, prefix="map_curve")
 
     # Save final model with CHT metadata
-    save_path = Path(args.project) / args.name / quant_folder / args.replace_mode / args.optimizer / 'weights' / 'last.pt'
+    save_path = get_weights_dir(args) / 'last.pt'
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    save_checkpoint(model, args, args.epochs, save_path)
+    save_checkpoint(model, args, args.epochs, save_path, run_metadata=run_metadata)
 
     # Close log file
     close_logging()

@@ -156,7 +156,9 @@ def _is_attention_module(module: nn.Module) -> bool:
 class BF16AttentionWrapper(nn.Module):
     """Wrapper to run attention modules with BF16 for softmax.
 
-    This wrapper patches the forward method of the wrapped module to run softmax in BF16.
+    The wrapped attention module runs under BF16 autocast on CUDA so protected
+    attention computation stays out of aggressive low-precision QAT paths while
+    avoiding mixed-dtype validation failures.
     """
 
     def __init__(self, module: nn.Module):
@@ -174,24 +176,27 @@ class BF16AttentionWrapper(nn.Module):
         self.m = module  # the actual module (for some operations)
         self.save = getattr(module, 'save', [])  # save list for _predict_once
 
-        # Patch the forward method to use BF16 for softmax
-        self._patch_forward()
-
-    def _patch_forward(self):
-        """Patch the forward method to run softmax in BF16."""
-        original_forward = self.wrapped_module.forward
-
-        def bf16_forward(x):
-            # Run the original forward
-            output = original_forward(x)
-            return output
-
-        # Replace the forward method
-        self.wrapped_module.forward = bf16_forward
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass."""
-        return self.wrapped_module(x)
+        input_dtype = x.dtype
+        target_device = x.device
+
+        for tensor in list(self.wrapped_module.parameters()) + list(self.wrapped_module.buffers()):
+            target_device = tensor.device
+            break
+
+        if x.device != target_device:
+            x = x.to(device=target_device)
+
+        if x.is_cuda:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                output = self.wrapped_module(x)
+        else:
+            output = self.wrapped_module(x)
+
+        if output.dtype != input_dtype:
+            output = output.to(input_dtype)
+        return output
 
     def train(self, mode=True):
         """Override train() to propagate training mode to wrapped module."""
@@ -599,7 +604,7 @@ class YOLO26nCHTQATModel(nn.Module):
                 self.nl = detect.nl if hasattr(detect, 'nl') else 4
             else:
                 self._set_default_detect()
-        except Exception:
+        except (AttributeError, IndexError, TypeError):
             self._set_default_detect()
 
     def _set_default_detect(self):
@@ -726,16 +731,14 @@ class YOLO26nCHTQATModel(nn.Module):
                     elif position == 'head' and replace_head:
                         should_replace = True
 
-                # Skip replacing Conv2d inside attention-related submodules
-                # These are critical parts of attention (qkv, proj, ffn, etc.)
-                # Unless replace_inside_attention is enabled
-                if not replace_inside_attention:
-                    if parent_is_attention or is_attention or _is_inside_attention_submodule(name):
-                        should_replace = False
+                attention_submodule = parent_is_attention or is_attention or _is_inside_attention_submodule(name)
+                critical_attention_conv = _is_critical_attention_conv(name)
+                skip_attention_quantization = critical_attention_conv or (
+                    not replace_inside_attention and attention_submodule
+                )
 
-                # CRITICAL: Never replace core attention components (qkv, proj, pe, ffn)
-                # These are essential to the attention mechanism and breaking them destroys model performance
-                if _is_critical_attention_conv(name):
+                # Skip replacing Conv2d inside protected attention-related submodules.
+                if skip_attention_quantization:
                     should_replace = False
 
                 if should_replace:
@@ -761,7 +764,7 @@ class YOLO26nCHTQATModel(nn.Module):
                         return QATConv2d_CHT(cht_layer, qconfig, quantization_dtype)
 
                     return cht_layer
-                elif enable_qat and isinstance(module, nn.Conv2d):
+                elif enable_qat and isinstance(module, nn.Conv2d) and not skip_attention_quantization:
                     # Apply QAT only (no CHT) - quantization to all layers
                     return QATConv2d(module, qconfig, quantization_dtype)
 
@@ -854,9 +857,8 @@ class YOLO26nCHTQATModel(nn.Module):
         - During training: list of feature tensors with gradients
         - During inference: tuple of (predictions, info_dict)
 
-        Note: Attention modules (C2PSA, C2f, etc.) are NOT replaced with QATConv2d_CHT,
-        so they don't receive int8/fp8 quantization. They run in FP32 by default,
-        which satisfies the requirement that attention layers should not use int8/fp8.
+        Note: Protected attention modules (C2PSA, C2f, etc.) are not wrapped with
+        QAT conv layers, and their execution is guarded by FP16 autocast on CUDA.
         """
         # Get raw output from the model
         raw_output = self._model(x)

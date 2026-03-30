@@ -1,0 +1,24 @@
+# YOLO QAT reproducibility requirements
+#
+# Recommended setup:
+# 1. conda create -n chts python=3.11 -y
+# 2. conda activate chts
+# 3. Install PyTorch and torchvision with the CUDA build that matches your machine.
+#    Example:
+#    conda install pytorch==2.5.1 torchvision==0.20.1 pytorch-cuda=12.1 -c pytorch -c nvidia
+# 4. pip install -r requirements.txt
+#
+# Notes:
+# - PyTorch is intentionally installed through conda for better CUDA reproducibility.
+# - Muon is vendored in this repo under ./Muon, so it does not need a separate pip install.
+
+ultralytics==8.3.59
+numpy==1.26.4
+opencv-python==4.10.0.84
+matplotlib==3.9.2
+PyYAML==6.0.2
+pillow==10.4.0
+pycocotools==2.0.8
+scikit-image==0.24.0
+tqdm==4.66.5
+wget==3.2

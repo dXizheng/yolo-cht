@@ -262,12 +262,59 @@ class Conv2d_CHT(nn.Module):
         """Synchronize num_zeros/num_active with actual mask state."""
         if not hasattr(self, 'mask') or self.mask is None:
             return
-        total_params = self.mask.numel()
-        actual_active = self.mask.sum().item()
-        actual_zeros = total_params - actual_active
-        self.num_zeros = actual_zeros
-        self.num_active = actual_active
+        mask_flat = self.mask.view(self.c_out, self.c_in * self.kernel_size * self.kernel_size)
+        zeros_per_channel = (~mask_flat).sum(dim=-1)
+        active_per_channel = mask_flat.sum(dim=-1)
+
+        # CHT evolution assumes a shared per-output-channel sparsity level.
+        if not torch.all(zeros_per_channel == zeros_per_channel[0]):
+            raise RuntimeError(
+                f"Inconsistent zeros per output channel: {zeros_per_channel}"
+            )
+        if not torch.all(active_per_channel == active_per_channel[0]):
+            raise RuntimeError(
+                f"Inconsistent active count per output channel: {active_per_channel}"
+            )
+
+        self.num_zeros = int(zeros_per_channel[0].item())
+        self.num_active = int(active_per_channel[0].item())
         self.num_update = int(self.link_update_ratio * self.num_active)
+
+    @torch.no_grad()
+    def _prune_to_target_sparsity(self):
+        """Bootstrap or increase sparsity by directly pruning lowest-magnitude weights."""
+        if self.mask is None or self.num_zeros <= 0:
+            return False
+
+        mask_flat = self.mask.view(self.c_out, -1)
+        current_zeros = (~mask_flat).sum(dim=-1)
+        additional_zeros = self.num_zeros - current_zeros
+
+        if torch.all(additional_zeros <= 0):
+            return False
+
+        weight_flat = self.weight.detach().abs().view(self.c_out, -1)
+
+        for out_idx in range(self.c_out):
+            zeros_needed = int(additional_zeros[out_idx].item())
+            if zeros_needed <= 0:
+                continue
+
+            active_indices = torch.nonzero(mask_flat[out_idx], as_tuple=False).flatten()
+            if active_indices.numel() < zeros_needed:
+                raise RuntimeError(
+                    f"Cannot prune {zeros_needed} new zeros from channel {out_idx}; only {active_indices.numel()} active weights remain."
+                )
+
+            active_weights = weight_flat[out_idx, active_indices]
+            prune_indices_local = torch.topk(active_weights, k=zeros_needed, largest=False).indices
+            prune_indices = active_indices[prune_indices_local]
+            mask_flat[out_idx, prune_indices] = False
+
+        self.mask.copy_(mask_flat.view_as(self.mask))
+        self._check_mask(self.mask, self.num_zeros)
+        self._sync_num_vars_with_mask()
+        return True
 
     @torch.no_grad()
     def evolve(self, current_epoch=None):
@@ -283,6 +330,11 @@ class Conv2d_CHT(nn.Module):
         # The num_update connections are removed based on weight magnitude each evolve
         if self.sparsity == 0. or self.link_update_ratio == 0.:
             return None, None, None
+
+        # Dense-to-sparse bootstrap: create the initial inactive positions before
+        # entering the normal remove/regrow evolution cycle.
+        if self._prune_to_target_sparsity():
+            return 0.0, 0.0, 0.0
 
         layer_name = getattr(self, 'layer_name', 'CHT_Layer')
         c_out, c_in = self.weight.shape[0], self.weight.shape[1]
@@ -307,6 +359,10 @@ class Conv2d_CHT(nn.Module):
 
             self.evolve_count += 1
 
+        target_num_zeros = self.num_zeros
+        target_num_active = self.num_active
+        target_num_update = self.num_update
+
         # Show current state
         current_active = self.mask.sum().item() if not self.use_hidden else self.hidden_mask.sum().item()
         total_params = self.mask.numel()
@@ -317,14 +373,43 @@ class Conv2d_CHT(nn.Module):
         remove_pos = self._remove()
         remove_time = time.time() - remove_start
 
-        # Sync num_vars with actual mask after removal
-        self._sync_num_vars_with_mask()
+        remove_flat = remove_pos.view(self.c_out, -1)
+        removed_per_channel = remove_flat.sum(dim=-1)
+        if not torch.all(removed_per_channel == removed_per_channel[0]):
+            raise RuntimeError(f"Inconsistent removed counts per output channel: {removed_per_channel}")
+        removed_count = int(removed_per_channel[0].item())
 
-        if self.use_ss:
-            self.sparsity = ss_sparsity
-            self.num_zeros = ss_num_zeros
-            self.num_active = ss_num_active
-            self.num_update = ss_num_update
+        # Adaptive num_update: ensure we don't try to regrow more than available inactive positions
+        if self.use_hidden and hasattr(self, 'hidden_mask') and self.hidden_mask is not None:
+            inactive_per_channel = (~self.hidden_mask.view(self.c_out, -1)).sum(dim=-1)
+        elif self.mask is not None:
+            inactive_per_channel = (~self.mask.view(self.c_out, -1)).sum(dim=-1)
+        else:
+            inactive_per_channel = None
+
+        inactive_count = int(inactive_per_channel.min().item()) if inactive_per_channel is not None else float('inf')
+
+        if target_num_update > inactive_count:
+            # Reduce num_update to available inactive positions
+            num_update_reduction = target_num_update - inactive_count
+            if self.debug:
+                print(f"[CHT DEBUG] {layer_name}: Adaptive - num_update: {target_num_update} -> {inactive_count}")
+            self.num_update = max(0, inactive_count)
+        else:
+            self.num_update = target_num_update
+
+        # Preserve the intended sparsity target across remove/regrow.
+        residual_removed = max(0, removed_count - self.num_update)
+        self.num_zeros = target_num_zeros + residual_removed
+        self.num_active = target_num_active - residual_removed
+
+        # Guard: skip evolve entirely if not enough inactive positions for meaningful update
+        if self.num_update <= 0:
+            if self.debug:
+                print(f"[CHT DEBUG] {layer_name}: Skipping evolve - no inactive positions available")
+            # Still need to return valid values for cancellation tracking
+            total_remove = remove_pos.sum().item()
+            return total_remove, 0.0, 0.0
 
         # Regrow connections
         regrow_start = time.time()
@@ -579,10 +664,20 @@ class Conv2d_CHT(nn.Module):
                                 print(f"[CHT DEBUG] Fallback for {layer_name}: not enough valid positions")
                                 print(f"             num_update={self.num_update}, min_valid={min_valid}")
                             inactive_mask = ~mask_flatten
+                            # Count inactive positions per output channel
+                            inactive_count = inactive_mask.sum(dim=-1, keepdim=True)
+                            # Limit num_update to available inactive positions
+                            num_update_safe = torch.minimum(
+                                self.num_update * torch.ones_like(inactive_count),
+                                inactive_count
+                            )
+                            max_update = num_update_safe.max().item()
+                            if max_update <= 0:
+                                return regrow_pos
                             # Sample from inactive positions uniformly
                             fallback_scores = inactive_mask.float()
                             fallback_scores = fallback_scores / fallback_scores.sum(dim=-1, keepdim=True)
-                            indices = torch.multinomial(fallback_scores, self.num_update, replacement=False)
+                            indices = torch.multinomial(fallback_scores, max_update, replacement=False)
                         else:
                             # Safe to use multinomial
                             indices = torch.multinomial(scores_extended, self.num_update, replacement=False)
